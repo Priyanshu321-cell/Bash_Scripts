@@ -1,0 +1,139 @@
+#!/usr/bin/env bash
+
+declare current=()
+declare previous=()
+
+BAR_CHAR='|'
+EMPTY_CHAR=' '
+BAR_LENGTH=50
+
+if [[ -z $NO_COLOR ]]; then 
+	COLOR1=$'\e[31m'
+	COLOR2=$'\e[35m'
+	COLOR3=$'\e[36m'
+	DIM=$'\e[2m'
+	RST=$'\e[0m'
+else 	
+	COLOR1=
+	COLOR2=
+	COLOR3=
+	DIM=
+	RST=
+fi
+
+# copy data from previous array to current array
+copy-data(){
+  previous=()
+
+  local key value
+  for key in "${!current[@]}"; do 
+    value=${current[$key]}
+    previous[$key]=$value
+  done
+}
+
+read-proc() {
+	local key user nice system idle iowait 
+	local irq softirq steal guest guest_nice
+
+  	local busy value num
+	while read -r key user nice system idle iowait irq softirq steal guest guest_nice; do
+		if [[ $key != cpu* ]] || [[ $key == 'cpu' ]]; then
+      			continue
+    		fi
+
+    	num=${key#cpu}
+
+    	busy=$((user + nice + system + irq + softirq + steal + guest + guest_nice ))
+    	idle=$((idle + iowait))
+    
+   	value="$busy $idle"
+    	current[$num]=$value
+
+    	#echo "$key busy = $busy idle = $idle"
+	done < /proc/stat
+}
+
+print-bar() {
+  local key=$1
+  
+  local busy1 idle1 busy2 idle2
+  read -r busy1 idle1 <<< "${previous[$key]}"
+  read -r busy2 idle2 <<< "${current[$key]}"
+
+  local busy=$((busy2- busy1))
+  local idle=$((idle2- idle1))
+  local total=$((busy + idle))
+
+  local usage=$((1000 * busy / total))
+
+  local int=$((usage / 10))
+  local frac=$((usage % 10))
+  local perc=$int.$frac
+
+  #echo "$key is $perc% busy"
+
+  local num_bars=$((usage * BAR_LENGTH / 1000)) 
+
+  local i
+  local s='['
+  for ((i=0;i<num_bars; i++)); do
+	s+=$COLOR1$BAR_CHAR$RST
+  done
+  for ((i=num_bars;i<BAR_LENGTH;i++));do
+	s+=$EMPTY_CHAR
+  done
+  s+=']'
+
+  echo "$s ${COLOR2}cpu$key$RST ${COLOR3}$perc%$RST"
+ }
+
+
+visualize-data(){
+  echo "${DIM}CPU usage on $COLOR3$HOSTNAME$RST "
+
+  local key
+  for key in "${!current[@]}"; do
+    print-bar "$key"
+  
+  done
+
+  local now
+  printf -v now '%(%Y-%m-%d %H:%M:%S)T'
+  echo "$DIM$now$RST"
+}
+
+cleanup(){
+  printf '\e[?1049l' # disable alt buffer
+  printf '\e[?25h' #enable alt buffer
+ 
+}
+
+main() {
+  read-proc
+  echo "Waiting for data !!"
+  
+  sleep 1
+	
+  trap cleanup EXIT
+
+  printf '\e[?1049h' # enable alt buffer
+  printf '\e[?25l' #enable alt buffer
+  printf '\e[H'#hide the cursor
+ 
+  local s 
+  while true; do 
+    copy-data
+    read-proc
+    
+    # s= ${ visualize-data; } 
+    printf '\e[2J'
+    printf '\e[H'
+	
+    visualize-data
+
+    sleep 1
+  done
+}
+
+main "$@"
