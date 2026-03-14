@@ -1,9 +1,132 @@
-#!/usr/bin/env bash
+#!/usr/bin/bash
 
-THRESHOLD=80
 
-df -h | awk 'NR>1 {
-	usage = $5
-	gsub(/%/, "", usage)
-	if(usage+0 > THRESHOLD+0) print "ALERT:", $6 , "is at", $5
-}' THRESHOLD=$THRESHOLD
+# --- Config --------------------------------------------------
+THRESHOLD=80                            # Alert if usage exceeds this %
+LOG_FILE="/var/log/disk_monitor.log"    # Log file path
+MONITOR_PATHS=("/" "/var" "/home")      # Mount points to check
+
+# Email settings
+ALERT_TO="you@example.com"             # Recipient
+ALERT_FROM="monitor@example.com"       # Sender (must match SMTP account)
+SMTP_HOST="smtp.gmail.com"
+SMTP_PORT="587"
+SMTP_USER="your_gmail@gmail.com"
+SMTP_PASS="your_app_password"          # Use a Gmail App Password, not your real password
+
+# Cooldown: minimum seconds between emails (3600 = 1 hour)
+COOLDOWN=3600
+COOLDOWN_FILE="/tmp/.disk_monitor_last_alert"
+# -------------------------------------------------------------
+
+TIMESTAMP=$(date '+%Y-%m-%d %H:%M:%S')
+
+log() {
+    echo "[$TIMESTAMP] $1" | tee -a "$LOG_FILE"
+}
+
+# --- Cooldown check ------------------------------------------
+cooldown_passed() {
+    if [ ! -f "$COOLDOWN_FILE" ]; then
+        return 0  # No previous alert — OK to send
+    fi
+    LAST=$(cat "$COOLDOWN_FILE")
+    NOW=$(date +%s)
+    DIFF=$(( NOW - LAST ))
+    if [ "$DIFF" -ge "$COOLDOWN" ]; then
+        return 0  # Enough time has passed — OK to send
+    else
+        REMAINING=$(( COOLDOWN - DIFF ))
+        log "COOLDOWN Next alert allowed in ${REMAINING}s"
+        return 1  # Too soon — skip
+    fi
+}
+
+# --- Email sender --------------------------------------------
+send_alert_email() {
+    local SUBJECT="$1"
+    local BODY="$2"
+
+    # Check if msmtp is available, fall back to sendmail
+    if command -v msmtp &>/dev/null; then
+        printf "To: %s\nFrom: %s\nSubject: %s\n\n%s\n" \
+            "$ALERT_TO" "$ALERT_FROM" "$SUBJECT" "$BODY" \
+        | msmtp \
+            --host="$SMTP_HOST" \
+            --port="$SMTP_PORT" \
+            --auth=on \
+            --user="$SMTP_USER" \
+            --passwordeval="echo $SMTP_PASS" \
+            --tls=on \
+            --tls-starttls=on \
+            --from="$ALERT_FROM" \
+            "$ALERT_TO"
+
+    elif command -v sendmail &>/dev/null; then
+        printf "To: %s\nFrom: %s\nSubject: %s\n\n%s\n" \
+            "$ALERT_TO" "$ALERT_FROM" "$SUBJECT" "$BODY" \
+        | sendmail -t
+
+    else
+        log "ERROR    No mail sender found (install msmtp or sendmail)"
+        return 1
+    fi
+
+    if [ $? -eq 0 ]; then
+        log "EMAIL    Alert sent to $ALERT_TO"
+        date +%s > "$COOLDOWN_FILE"   # Save timestamp for cooldown
+    else
+        log "ERROR    Failed to send alert email"
+    fi
+}
+
+# =============================================================
+#  Main
+# =============================================================
+
+log "--- Disk check started ---"
+
+ALERT_TRIGGERED=false
+ALERT_DETAILS=""
+
+for MOUNT in "${MONITOR_PATHS[@]}"; do
+
+    # Skip if mount point doesn't exist
+    if ! mountpoint -q "$MOUNT" 2>/dev/null && [ ! -d "$MOUNT" ]; then
+        log "SKIP     $MOUNT — path not found"
+        continue
+    fi
+
+    # Parse usage % for this mount point
+    USAGE=$(df "$MOUNT" | awk 'NR==2 {gsub(/%/,"",$5); print $5}')
+
+    if [ -z "$USAGE" ]; then
+        log "SKIP     $MOUNT — could not read usage"
+        continue
+    fi
+
+    if [ "$USAGE" -gt "$THRESHOLD" ]; then
+        log "ALERT    $MOUNT — ${USAGE}% used (threshold: ${THRESHOLD}%)"
+        ALERT_TRIGGERED=true
+        ALERT_DETAILS+="  - $MOUNT is at ${USAGE}% (threshold: ${THRESHOLD}%)\n"
+    else
+        log "OK       $MOUNT — ${USAGE}% used"
+    fi
+
+done
+
+# --- Send email if needed ------------------------------------
+if [ "$ALERT_TRIGGERED" = true ]; then
+    log "RESULT   One or more partitions exceeded threshold"
+
+    if cooldown_passed; then
+        HOSTNAME=$(hostname)
+        SUBJECT="[DISK ALERT] High disk usage on $HOSTNAME"
+        BODY="Warning: the following partitions on $HOSTNAME have exceeded the ${THRESHOLD}% threshold:\n\n${ALERT_DETAILS}\nChecked at: $(date)\nLog file: $LOG_FILE"
+        send_alert_email "$SUBJECT" "$(printf "$BODY")"
+    fi
+else
+    log "RESULT   All partitions within limits"
+fi
+
+log "--- Disk check finished ---"
